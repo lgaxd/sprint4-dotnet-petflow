@@ -1,0 +1,129 @@
+# PetFlow — ambiente local via Docker.
+#
+# Dois modos, escolhidos pelo conteúdo do arquivo .env (ConnectionStrings__OracleConnection):
+#
+#   LOCAL (sem .env, ou .env sem credenciais reais)   ->  docker compose up --build
+#       sobe API + Oracle + MongoDB em contêiner e cria/carrega o schema sozinho.
+#
+#   FIAP  (.env com as credenciais do Oracle da FIAP)  ->  docker compose up --build api-fiap
+#       sobe SOMENTE a API, apontando para o Oracle da FIAP. Se você rodar o modo LOCAL com credenciais no .env,
+#       o serviço "guard" aborta a subida antes de iniciar Oracle/MongoDB.
+#
+# Atalho que escolhe o modo sozinho:  ./start.sh   (opção --with-mongo no modo FIAP sobe também o MongoDB: serviço mongo-fiap)
+# Swagger: http://localhost:5000/swagger · Recriar os bancos locais do zero: docker compose down -v
+
+services:
+  # ───────────────────────── Validação do .env ─────────────────────────
+  guard:
+    image: alpine:3.20
+    container_name: petflow-guard
+    command: ["sh", "/work/docker/guard.sh"]
+    volumes:
+      - ./:/work:ro            # a pasta inteira (e não só o .env): não quebra quando o .env não existe
+
+  # ───────────────────────── Modo LOCAL ─────────────────────────
+  oracle:
+    image: gvenzl/oracle-free:23-slim-faststart
+    container_name: petflow-oracle
+    depends_on:
+      guard:
+        condition: service_completed_successfully
+    environment:
+      ORACLE_PASSWORD: ${ORACLE_SYS_PASSWORD:-PetFlowSys123}   # senha do SYS/SYSTEM
+      APP_USER: petflow                                        # schema usado pela API
+      APP_USER_PASSWORD: ${ORACLE_APP_PASSWORD:-PetFlow123}
+    ports:
+      - "1521:1521"                                            # opcional: SQL Developer em localhost:1521/FREEPDB1
+    volumes:
+      - oracle-data:/opt/oracle/oradata
+      # O script abaixo roda na PRIMEIRA subida do volume e carrega os .sql de /seed como usuário PETFLOW.
+      - ./docker/oracle-init/01_carga.sh:/container-entrypoint-initdb.d/01_carga.sh:ro
+      - ./Database/2TDSPX_CodigoSql_PetFlow.sql:/seed/2TDSPX_CodigoSql_PetFlow.sql:ro
+      - ./Database/03_EF_Baseline.sql:/seed/03_EF_Baseline.sql:ro
+      # Opcional (pacotes PL/SQL da disciplina de banco; a API não depende deles):
+      # - ./Database/01_PetFlow_Sprint4_Pacotes.sql:/seed/01_PetFlow_Sprint4_Pacotes.sql:ro
+    healthcheck:
+      test: ["CMD", "healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+
+  mongo:
+    image: mongo:7
+    container_name: petflow-mongo
+    depends_on:
+      guard:
+        condition: service_completed_successfully
+    ports:
+      - "27017:27017"                                          # opcional: mongosh / Compass
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    container_name: petflow-api
+    depends_on:
+      oracle:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+    ports:
+      - "5000:8080"
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ConnectionStrings__OracleConnection: "Data Source=(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=oracle)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=FREEPDB1)));User Id=petflow;Password=${ORACLE_APP_PASSWORD:-PetFlow123};"
+      MongoDb__ConnectionString: mongodb://mongo:27017
+      MongoDb__Database: petflow
+      Jwt__Key: ${JWT_KEY:-chave-jwt-somente-para-ambiente-local-docker-123456}
+      Jwt__ExpirationMinutes: "1440"
+      Cors__AllowedOrigins: http://localhost:5173
+      Database__ApplyMigrationsOnStartup: "false"            # o schema já vem do script SQL
+    restart: on-failure
+
+  # ───────────────────────── Modo FIAP (somente a API) ─────────────────────────
+  api-fiap:
+    profiles: ["fiap"]                                         # só sobe quando citado: docker compose up --build api-fiap
+    build: .
+    container_name: petflow-api-fiap
+    env_file:
+      - .env                                                   # credenciais do Oracle da FIAP, JWT etc.
+    ports:
+      - "5000:8080"
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      # O "localhost" do .env não vale dentro do contêiner. Padrão: MongoDB do compose (use --with-mongo no start.sh)
+      # ou defina FIAP_MONGO_CONNECTION no .env para usar outro (ex.: Atlas, ou mongodb://host.docker.internal:27017).
+      MongoDb__ConnectionString: ${FIAP_MONGO_CONNECTION:-mongodb://mongo:27017}
+      Database__ApplyMigrationsOnStartup: "false"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: on-failure
+
+  # MongoDB opcional do modo FIAP (./start.sh --with-mongo). Responde pelo nome "mongo", como no modo local.
+  mongo-fiap:
+    profiles: ["fiap"]
+    image: mongo:7
+    container_name: petflow-mongo-fiap
+    networks:
+      default:
+        aliases:
+          - mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  oracle-data:
+  mongo-data:

@@ -1,0 +1,19 @@
+**/bin/
+**/obj/
+**/logs/
+.vs/
+.vscode/
+.git/
+.gitignore
+.gitattributes
+
+# Credenciais locais nunca entram na imagem
+.env
+.env.*
+
+PetFlowAPI.Tests/
+Database/
+docs/
+README.md
+docker-compose*.yml
+Dockerfile
